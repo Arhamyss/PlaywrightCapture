@@ -4,6 +4,7 @@ import json
 import os
 import random
 import logging
+import time
 
 from tempfile import NamedTemporaryFile
 from typing import Optional, Dict, List, Union, Any, TypedDict
@@ -31,6 +32,15 @@ class CaptureResponse(TypedDict, total=False):
     cookies: List[Cookie]
     har: Dict[str, Any]
     error: Optional[str]
+
+wait_for_download = False
+
+
+async def handle_download(download):
+    wait_for_download = True
+    print(await download.path())
+    print(await download.failure())
+    wait_for_download = False
 
 
 class Capture():
@@ -86,7 +96,7 @@ class Capture():
     async def prepare_context(self) -> None:
         self.context = await self.browser.new_context(
             record_har_path=self._temp_harfile.name,
-            # record_video_dir='./video/',
+            #record_video_dir='./video/',
             ignore_https_errors=True,
             viewport=self.viewport,
             user_agent=self.user_agent,
@@ -245,48 +255,56 @@ class Capture():
         to_return: CaptureResponse = {}
         try:
             page = await self.context.new_page()
-            await page.goto(url, wait_until='load', referer=referer if referer else '')
-            await page.bring_to_front()
+            page.on("download", handle_download)
+            await page.goto(url, wait_until='commit', referer=referer if referer else '')
+            try:
+                await page.wait_for_load_state("load", timeout=5000)
+                await page.bring_to_front()
+                # path = await page.video.path()
+                # print(path)
 
-            # page instrumentation
-            await page.wait_for_timeout(5000)  # Wait 5 sec after document loaded
+                # page instrumentation
+                await page.wait_for_timeout(5000)  # Wait 5 sec after document loaded
 
-            # ==== recaptcha
-            # Same technique as: https://github.com/NikolaiT/uncaptcha3
-            if CAN_SOLVE_CAPTCHA and await page.is_visible("//iframe[@title='reCAPTCHA']", timeout=5 * 1000):
-                self.logger.info('Found a captcha')
-                try:
-                    await self.recaptcha_solver(page)
-                except Error:
-                    self.logger.exception('Error while resolving captcha.')
-                except Exception:
-                    self.logger.exception('General error with captcha solving.')
-            # ======
+                # ==== recaptcha
+                # Same technique as: https://github.com/NikolaiT/uncaptcha3
+                if CAN_SOLVE_CAPTCHA and await page.is_visible("//iframe[@title='reCAPTCHA']", timeout=5 * 1000):
+                    self.logger.info('Found a captcha')
+                    try:
+                        await self.recaptcha_solver(page)
+                    except Error:
+                        self.logger.exception('Error while resolving captcha.')
+                    except Exception:
+                        self.logger.exception('General error with captcha solving.')
+                # ======
 
-            # check if we have anything on the page. If we don't, the page is not working properly.
-            if await page.content():
-                # move mouse
-                await page.mouse.move(x=500, y=400)
+                # check if we have anything on the page. If we don't, the page is not working properly.
+                if await page.content():
+                    # move mouse
+                    await page.mouse.move(x=500, y=400)
+                    await self._safe_wait(page)
+                    self.logger.debug('Moved mouse')
+
+                    # scroll
+                    # NOTE using page.mouse.wheel causes the instrumentation to fail, sometimes
+                    await page.mouse.wheel(delta_y=2000, delta_x=0)
+                    await self._safe_wait(page)
+                    await page.keyboard.press('PageUp')
+                    self.logger.debug('Scrolled')
+
                 await self._safe_wait(page)
-                self.logger.debug('Moved mouse')
+                await page.wait_for_timeout(5000)  # Wait 5 sec after network idle
+                to_return['html'] = await page.content()
+                to_return['png'] = await page.screenshot(full_page=True)
 
-                # scroll
-                # NOTE using page.mouse.wheel causes the instrumentation to fail, sometimes
-                await page.mouse.wheel(delta_y=2000, delta_x=0)
-                await self._safe_wait(page)
-                await page.keyboard.press('PageUp')
-                self.logger.debug('Scrolled')
+            except PlaywrightTimeoutError as e:
+                to_return['error'] = f"The capture took too long - {e.message}"
+            except Error as e:
+                to_return['error'] = e.message
+                self.logger.exception('Something went poorly.')
 
-            await self._safe_wait(page)
-            await page.wait_for_timeout(5000)  # Wait 5 sec after network idle
-            to_return['html'] = await page.content()
-            to_return['png'] = await page.screenshot(full_page=True)
-
-        except PlaywrightTimeoutError as e:
-            to_return['error'] = f"The capture took too long - {e.message}"
-        except Error as e:
-            to_return['error'] = e.message
-            self.logger.exception('Something went poorly.')
+            except Exception:
+                pass
         finally:
             to_return['last_redirected_url'] = page.url
             to_return['cookies'] = await self.context.cookies()
@@ -297,9 +315,12 @@ class Capture():
         self.logger.debug('Capture done')
         return to_return
 
+
     async def __aexit__(self, exc_type, exc, tb) -> None:  # type: ignore
         if hasattr(self, '_temp_harfile'):
             os.unlink(self._temp_harfile.name)
 
+        while wait_for_download:
+            time.sleep(1)
         await self.browser.close()
         await self.playwright.stop()  # type: ignore
